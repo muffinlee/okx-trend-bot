@@ -1,0 +1,26 @@
+2026-10-17 13:11:07,411 WARNING LIVE TRADING MODE - real money at risk
+2026-10-17 13:11:12,417 INFO === core_trend run | mode=LIVE dry_run=True core=50% max=100% ===
+2026-10-17 13:13:02,184 WARNING LIVE TRADING MODE - real money at risk
+2026-10-17 13:13:07,191 INFO === core_trend run | mode=LIVE dry_run=True core=50% max=100% ===
+2026-10-17 13:13:18,591 INFO equity=949.50 USDT | invested now 26.4% -> target 79.4%
+2026-10-17 13:13:18,592 INFO   BTC-USDT  trend=0.7 vol=37%  now   4.4%  target  24.9% (raw  24.9%)
+2026-10-17 13:13:18,592 INFO   ETH-USDT  trend=0.3 vol=46%  now   9.9%  target  15.8% (raw  15.8%)
+2026-10-17 13:13:18,592 INFO   SOL-USDT  trend=0.7 vol=55%  now  10.6%  target  16.4% (raw  16.4%)
+2026-10-17 13:13:18,592 INFO   BNB-USDT  trend=0.7 vol=41%  now   1.5%  target  22.3% (raw  22.3%)
+2026-10-17 13:13:18,592 INFO BUY  BTC-USDT ~194.69 USDT (fee ~1.36)
+2026-10-17 13:13:18,592 INFO BUY  ETH-USDT ~56.68 USDT (fee ~0.40)
+2026-10-17 13:13:18,593 INFO BUY  SOL-USDT ~55.08 USDT (fee ~0.39)
+2026-10-17 13:13:18,593 INFO BUY  BNB-USDT ~196.97 USDT (fee ~1.38)
+2026-10-17 13:13:18,593 INFO === rebalance complete ===
+2026-10-17 13:22:30,110 WARNING LIVE TRADING MODE - real money at risk
+2026-10-17 13:22:35,116 INFO === core_trend run | mode=LIVE dry_run=True core=50% max=100% ===
+2026-10-17 13:22:48,572 INFO equity=949.49 USDT | invested now 26.4% -> target 79.4%
+2026-10-17 13:22:48,575 INFO   BTC-USDT  trend=0.7 vol=37%  now   4.4%  target  24.9% (raw  24.9%)
+2026-10-17 13:22:48,575 INFO   ETH-USDT  trend=0.3 vol=46%  now   9.9%  target  15.8% (raw  15.8%)
+2026-10-17 13:22:48,575 INFO   SOL-USDT  trend=0.7 vol=55%  now  10.6%  target  16.4% (raw  16.4%)
+2026-10-17 13:22:48,575 INFO   BNB-USDT  trend=0.7 vol=41%  now   1.5%  target  22.3% (raw  22.3%)
+2026-10-17 13:22:48,575 INFO BUY  BTC-USDT ~194.69 USDT (fee ~1.36)
+2026-10-17 13:22:48,575 INFO BUY  ETH-USDT ~56.63 USDT (fee ~0.40)
+2026-10-17 13:22:48,575 INFO BUY  SOL-USDT ~55.13 USDT (fee ~0.39)
+2026-10-17 13:22:48,575 INFO BUY  BNB-USDT ~196.97 USDT (fee ~1.38)
+2026-10-17 13:22:48,575 INFO === rebalance complete ===
