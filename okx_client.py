@@ -164,3 +164,9 @@ def market_sell(inst_id, base_amount, lot_sz):
         "instId": inst_id, "tdMode": "cash", "side": "sell",
         "ordType": "market", "sz": sz_str,
     }, auth=True)
+
+
+def get_order(inst_id, ord_id):
+    """Fill details for one order: avgPx, accFillSz, fee (negative), feeCcy, state, fillTime."""
+    return _request("GET", "/api/v5/trade/order",
+                    {"instId": inst_id, "ordId": ord_id}, auth=True)[0]

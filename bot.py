@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 
 import config
 import okx_client as okx
+import notifier
 import strategy as S
 
 # apply config to strategy defaults
@@ -68,6 +69,65 @@ def run_once(dry_run=False, force=False):
     raise ValueError(f"unknown STRATEGY_MODE {config.STRATEGY_MODE!r}")
 
 
+# ---------------------------------------------------------------- ledgers
+TRADE_COLS = ["time_utc", "order_id", "coin", "side", "filled_qty", "avg_price_usdt",
+              "notional_usdt", "fee", "fee_ccy", "fee_usdt", "state"]
+EQUITY_COLS = ["date", "equity_usdt", "usdt"] + \
+    [f"{c.split('-')[0].lower()}_{k}" for c in config.COINS for k in ("qty", "price", "value")]
+
+
+def _append_csv(path, cols, row):
+    import csv
+    new = not os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow(cols)
+        w.writerow(row)
+
+
+def record_fills(placed):
+    """Look up each order's actual fill on OKX and append it to trades.csv."""
+    for inst, oid in placed:
+        o = None
+        for _ in range(3):
+            try:
+                o = okx.get_order(inst, oid)
+                if o.get("state") == "filled":
+                    break
+            except okx.OkxError as e:
+                log.warning("order lookup %s %s failed: %s", inst, oid, e)
+            time.sleep(2)
+        if not o:
+            _append_csv(config.TRADES_FILE, TRADE_COLS,
+                        [datetime.now(timezone.utc).isoformat(timespec="seconds"), oid,
+                         inst.split("-")[0], "?", "", "", "", "", "", "", "lookup failed"])
+            continue
+        qty, px = float(o.get("accFillSz") or 0), float(o.get("avgPx") or 0)
+        fee, fccy = float(o.get("fee") or 0), o.get("feeCcy", "")
+        fee_usdt = abs(fee) * (px if fccy == inst.split("-")[0] else 1.0)
+        ts = o.get("fillTime") or o.get("uTime")
+        when = datetime.fromtimestamp(int(ts) / 1000, timezone.utc).isoformat(timespec="seconds") \
+            if ts else datetime.now(timezone.utc).isoformat(timespec="seconds")
+        _append_csv(config.TRADES_FILE, TRADE_COLS,
+                    [when, oid, inst.split("-")[0], o.get("side", ""), f"{qty:.8f}",
+                     f"{px:.6f}", f"{qty * px:.2f}", f"{fee:.8f}", fccy,
+                     f"{fee_usdt:.4f}", o.get("state", "")])
+        log.info("ledger: %s %s %.8f @ %.4f fee %.4f USDT", o.get("side"), inst, qty, px, fee_usdt)
+
+
+def record_equity(day, equity, usdt, held, prices):
+    import csv
+    if os.path.exists(config.EQUITY_FILE):
+        with open(config.EQUITY_FILE) as f:
+            if any(r and r[0] == day for r in csv.reader(f)):
+                return
+    row = [day, f"{equity:.2f}", f"{usdt:.2f}"]
+    for c in config.COINS:
+        row += [f"{held[c]:.8f}", f"{prices[c]:.6f}", f"{held[c] * prices[c]:.2f}"]
+    _append_csv(config.EQUITY_FILE, EQUITY_COLS, row)
+
+
 # ---------------------------------------------------------------- core_trend
 def _days_since(day_str):
     if not day_str:
@@ -77,26 +137,17 @@ def _days_since(day_str):
 
 
 def run_core_trend(dry_run=False, force=False):
-    """Weekly rebalance toward core + trend + inverse-vol target weights.
-    Stateless with respect to positions: holdings are read from the
-    exchange each run, so manual trades are simply rebalanced away."""
+    """Runs daily. Every REBALANCE_DAYS it trades toward core + trend +
+    inverse-vol target weights; every day it records the account value and
+    sends the email digest. Holdings are read from the exchange each run,
+    so manual trades in these coins are rebalanced away."""
     mode = "DEMO" if config.DEMO_MODE else "LIVE"
     log.info("=== core_trend run | mode=%s dry_run=%s core=%.0f%% max=%.0f%% ===",
              mode, dry_run, config.CORE_FRACTION * 100, config.MAX_EXPOSURE * 100)
     state = load_state()
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if state.get("positions"):
-        log.warning("state.json has breakout positions; core_trend ignores them "
-                    "and rebalances from actual exchange balances")
-
     since = _days_since(state.get("last_rebalance"))
-    if since < config.REBALANCE_DAYS and not force:
-        log.info("last rebalance %s (%d days ago) - next in %d day(s); nothing to do",
-                 state.get("last_rebalance"), since, config.REBALANCE_DAYS - since)
-        state["last_run_day"] = today
-        if not dry_run:
-            save_state(state)
-        return
+    due = force or since >= config.REBALANCE_DAYS
 
     # 1) signals from confirmed daily closes
     need = S.core_trend_warmup(config.TREND_LOOKBACKS, config.VOL_LEN)
@@ -105,27 +156,28 @@ def run_core_trend(dry_run=False, force=False):
         h = okx.get_daily_history(c, config.CANDLES_NEEDED_CT)
         if len(h["close"]) < need:
             # never trade on partial data: a missing coin would get a 0% target
-            # and be sold off. Abort and retry on the next run instead.
-            log.error("%s: only %d daily candles, need %d - aborting this run, "
-                      "nothing traded", c, len(h["close"]), need)
-            return
+            # and be sold off. Raise so the loop retries in 15 minutes.
+            raise okx.OkxError(f"{c}: only {len(h['close'])} daily candles, need "
+                               f"{need} - nothing traded")
         closes[c], idx[c] = h["close"], len(h["close"]) - 1
 
     # 2) account snapshot at live prices
-    try:
-        balances = okx.get_balances()
-    except okx.OkxError as e:
-        if not dry_run:
-            raise
-        log.warning("dry-run without credentials (%s); assuming 1,000 USDT", e)
-        balances = {"USDT": 1000.0}
+    def snapshot():
+        try:
+            bal = okx.get_balances()
+        except okx.OkxError as e:
+            if not dry_run:
+                raise
+            log.warning("dry-run without credentials (%s); assuming 1,000 USDT", e)
+            bal = {"USDT": 1000.0}
+        usdt_ = bal.get("USDT", 0.0)
+        held_ = {c: bal.get(c.split("-")[0], 0.0) for c in config.COINS}
+        eq_ = usdt_ + sum(held_[c] * prices[c] for c in config.COINS)
+        return usdt_, held_, eq_
     prices = {c: okx.get_ticker(c) for c in config.COINS}
-    usdt = balances.get("USDT", 0.0)
-    held = {c: balances.get(c.split("-")[0], 0.0) for c in config.COINS}
-    equity = usdt + sum(held[c] * prices[c] for c in config.COINS)
+    usdt, held, equity = snapshot()
     if equity <= 0:
-        log.error("zero equity, aborting")
-        return
+        raise okx.OkxError("account value is zero - check the API key's account")
     cur_w = {c: held[c] * prices[c] / equity for c in config.COINS}
 
     tgt, info = S.core_trend_targets(
@@ -142,67 +194,144 @@ def run_core_trend(dry_run=False, force=False):
                  "n/a" if v is None else f"{v * 100:.0f}%",
                  100 * cur_w[c], 100 * tgt.get(c, 0.0), 100 * raw)
 
-    # 3) sells first (raise cash), then buys
-    orders = []
-    for c in config.COINS:
-        delta = (tgt.get(c, 0.0) - cur_w[c]) * equity
-        if delta < -config.MIN_NOTIONAL_USDT:
-            amount = held[c] if tgt.get(c, 0.0) == 0 else min(held[c], -delta / prices[c])
-            orders.append(("SELL", c, amount, -delta))
-    failed = []
-    for side, c, amount, usd in orders:
-        log.info("SELL %s %.8f (~%.2f USDT, fee ~%.2f)", c, amount, usd,
-                 usd * config.FEE_RATE)
-        if dry_run:
-            continue
-        try:
-            inst = okx.get_instrument(c)
-            if amount < inst["minSz"]:
-                log.warning("SKIP sell %s: %.8f below OKX minimum %s", c, amount, inst["minSz"])
-                continue
-            okx.market_sell(c, amount, inst["lotSz"])
-        except okx.OkxError as e:
-            log.error("SELL %s failed: %s", c, e)
-            failed.append(c)
-    if orders and not dry_run:
-        time.sleep(2)
-        usdt = okx.get_balances().get("USDT", 0.0)
-    elif orders:
-        usdt += sum(o[3] for o in orders) * (1 - config.FEE_RATE)
-
-    cash = usdt * 0.995          # small buffer so buys never exceed cash
-    for c in config.COINS:
-        delta = (tgt.get(c, 0.0) - cur_w[c]) * equity
-        if delta > config.MIN_NOTIONAL_USDT:
-            usd = min(delta, cash)
-            if usd < config.MIN_NOTIONAL_USDT:
-                log.info("SKIP buy %s: only %.2f USDT cash left", c, cash)
-                continue
-            log.info("BUY  %s ~%.2f USDT (fee ~%.2f)", c, usd, usd * config.FEE_RATE)
+    trades, failed = [], []
+    if not due:
+        next_note = (f"Next rebalance in {config.REBALANCE_DAYS - since} day(s) "
+                     f"(last: {state.get('last_rebalance')}).")
+        log.info("last rebalance %s (%d days ago) - next in %d day(s); nothing to trade",
+                 state.get("last_rebalance"), since, config.REBALANCE_DAYS - since)
+    else:
+        # 3) sells first (raise cash), then buys
+        placed = []          # (inst_id, ordId) for the trade ledger
+        orders = []
+        for c in config.COINS:
+            delta = (tgt.get(c, 0.0) - cur_w[c]) * equity
+            if delta < -config.MIN_NOTIONAL_USDT:
+                amount = held[c] if tgt.get(c, 0.0) == 0 else min(held[c], -delta / prices[c])
+                orders.append((c, amount, -delta))
+        for c, amount, usd in orders:
+            log.info("SELL %s %.8f (~%.2f USDT, fee ~%.2f)", c, amount, usd,
+                     usd * config.FEE_RATE)
             if not dry_run:
                 try:
-                    okx.market_buy(c, usd)
+                    inst = okx.get_instrument(c)
+                    if amount < inst["minSz"]:
+                        log.warning("SKIP sell %s: %.8f below OKX minimum %s",
+                                    c, amount, inst["minSz"])
+                        continue
+                    res = okx.market_sell(c, amount, inst["lotSz"])
+                    placed.append((c, res[0]["ordId"]))
                 except okx.OkxError as e:
-                    log.error("BUY %s failed: %s", c, e)
+                    log.error("SELL %s failed: %s", c, e)
                     failed.append(c)
                     continue
-            cash -= usd
+            trades.append(f"Sold {c.split('-')[0]} ~${usd:,.2f}")
+        if orders and not dry_run:
+            time.sleep(2)
+            usdt = okx.get_balances().get("USDT", 0.0)
+        elif orders:
+            usdt += sum(o[2] for o in orders) * (1 - config.FEE_RATE)
 
-    if failed:
-        # keep the weekly timer unchanged so tomorrow's run tries again
-        state["last_run_day"] = today
-        if not dry_run:
-            save_state(state)
-        log.error("=== rebalance incomplete: %s failed - will retry next run ===",
-                  ", ".join(failed))
-        return
+        cash = usdt * 0.995          # small buffer so buys never exceed cash
+        for c in config.COINS:
+            delta = (tgt.get(c, 0.0) - cur_w[c]) * equity
+            if delta > config.MIN_NOTIONAL_USDT:
+                usd = min(delta, cash)
+                if usd < config.MIN_NOTIONAL_USDT:
+                    log.info("SKIP buy %s: only %.2f USDT cash left", c, cash)
+                    continue
+                log.info("BUY  %s ~%.2f USDT (fee ~%.2f)", c, usd, usd * config.FEE_RATE)
+                if not dry_run:
+                    try:
+                        res = okx.market_buy(c, usd)
+                        placed.append((c, res[0]["ordId"]))
+                    except okx.OkxError as e:
+                        log.error("BUY %s failed: %s", c, e)
+                        failed.append(c)
+                        continue
+                trades.append(f"Bought {c.split('-')[0]} ~${usd:,.2f}")
+                cash -= usd
 
-    state["last_rebalance"] = today
+        if failed:
+            # keep the weekly timer unchanged so tomorrow's run tries again
+            log.error("=== rebalance incomplete: %s failed - will retry next run ===",
+                      ", ".join(failed))
+            trades.append("FAILED: " + ", ".join(failed) + " - will retry tomorrow")
+            next_note = "Rebalance incomplete - the bot retries tomorrow."
+        else:
+            state["last_rebalance"] = today
+            state["last_targets"] = tgt
+            next_note = f"Rebalanced today. Next rebalance in {config.REBALANCE_DAYS} days."
+            log.info("=== rebalance complete ===")
+        if not trades:
+            trades.append("Rebalance check done - every coin within 5% of target, no trades.")
+        if not dry_run and (trades or failed):
+            time.sleep(2)
+            record_fills(placed)
+            usdt, held, equity = snapshot()     # post-trade picture for the digest
+
+    # 4) record value + daily digest
+    hist = state.setdefault("history", {})
+    hist[today] = round(equity, 2)
+    for old in sorted(hist)[:-400]:
+        del hist[old]
+    state.setdefault("bot_start", {"date": today, "equity": round(equity, 2)})
     state["last_run_day"] = today
-    state["last_targets"] = tgt
+
+    def ago(n):
+        days = sorted(d for d in hist if d < today)
+        target = (datetime.now(timezone.utc).date().toordinal() - n)
+        cands = [d for d in days
+                 if datetime.strptime(d, "%Y-%m-%d").date().toordinal() <= target]
+        return hist[cands[-1]] if cands else None
+    perf = {}
+    for key, n in (("1d", 1), ("7d", 7)):
+        base = ago(n)
+        perf[key] = equity / base - 1 if base else None
+    perf["start"] = equity / state["bot_start"]["equity"] - 1 \
+        if state["bot_start"]["date"] != today else None
+    cap = os.environ.get("START_CAPITAL_USDT", "").strip()
+    if cap:
+        try:
+            perf["capital"] = equity / float(cap) - 1
+        except ValueError:
+            pass
+
+    coins = []
+    for c in config.COINS:
+        cl = closes[c]
+        coins.append({
+            "coin": c.split("-")[0], "qty": held[c], "value": held[c] * prices[c],
+            "w": held[c] * prices[c] / equity,
+            "tgt": info[c][2] if c in info else 0.0,   # strategy target (before 5% band)
+            "trend": f"{info[c][0]:.1f}" if c in info else "n/a",
+            "chg1d": prices[c] / cl[-1] - 1 if cl else None,
+            "chg7d": prices[c] / cl[-7] - 1 if len(cl) >= 7 else None})
+    warnings = []
+    if config.DEMO_MODE:
+        warnings.append("DEMO mode - these are not your real balances.")
+    digest = {"date": today, "mode": mode, "equity": equity, "usdt": usdt,
+              "cash_w": usdt / equity, "invested": 1 - usdt / equity,
+              "target_total": sum(info[c][2] for c in info), "perf": perf, "coins": coins,
+              "trades": trades if due else [], "next_note": next_note,
+              "warnings": warnings}
+    if not dry_run:
+        record_equity(today, equity, usdt, held, prices)
+    subject, html, text = notifier.build_digest(digest)
+    # attach the full trade ledger + daily values on rebalance days and on the
+    # 1st of each quarter, so your inbox always holds the complete history
+    attach = []
+    if due or today[5:] in ("01-01", "04-01", "07-01", "10-01"):
+        for f in (config.TRADES_FILE, config.EQUITY_FILE):
+            if os.path.exists(f):
+                attach.append((os.path.basename(f), open(f, "rb").read()))
+    if dry_run:
+        log.info("digest preview (not sent in dry-run):\n%s", text)
+    elif state.get("last_digest") != today:
+        if notifier.send(subject, html, text, attachments=attach):
+            state["last_digest"] = today
     if not dry_run:
         save_state(state)
-    log.info("=== rebalance complete ===")
 
 
 # ---------------------------------------------------------------- breakout
@@ -337,8 +466,13 @@ def loop():
         if state.get("last_run_day") != today:
             try:
                 run_once(dry_run=False)
-            except Exception:
+            except Exception as e:
                 log.exception("run failed; will retry in 15 min")
+                st = load_state()
+                if st.get("last_error_mail") != today:
+                    if notifier.send_error(today, f"{type(e).__name__}: {e}"):
+                        st["last_error_mail"] = today
+                        save_state(st)
                 time.sleep(900)
                 continue
         time.sleep(300)

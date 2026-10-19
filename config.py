@@ -73,5 +73,7 @@ BASE_URL = os.environ.get("OKX_BASE_URL", "https://app.okx.com")
 _DATA_DIR = "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(_DATA_DIR, "state.json")
 LOG_FILE = os.path.join(_DATA_DIR, "bot.log")
+TRADES_FILE = os.path.join(_DATA_DIR, "trades.csv")    # every filled order
+EQUITY_FILE = os.path.join(_DATA_DIR, "equity.csv")    # one row per day
 CANDLES_NEEDED = 130        # breakout mode: bars fetched (warmup 101)
 CANDLES_NEEDED_CT = 400     # core_trend mode: needs 365+ days of history
